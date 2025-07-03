@@ -1,1 +1,4 @@
-python-telegram-bot pytube
+python-telegram-bot==20.3
+yt-dlp==2025.06.30
+requests==2.31.0
+python-dotenv==1.0.0
