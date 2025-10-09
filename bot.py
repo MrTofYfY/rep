@@ -1,209 +1,181 @@
-# main.py
+import os
 import asyncio
 import json
 import logging
-import os
 from pathlib import Path
-
 from dotenv import load_dotenv
-import openai
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import base64
 
-# -----------------------
-# Загрузка .env
-# -----------------------
-load_dotenv()  # прочитает .env из текущей директории
-
+# ----------------- Load .env -----------------
+load_dotenv()
 BOT_TOKEN = os.getenv("TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "mellfreezy")
+CHAT_API_URL = os.getenv("CHAT_API_URL", "http://127.0.0.1:5000/generate")
+IMG_API_URL = os.getenv("IMG_API_URL", "http://127.0.0.1:7860/sdapi/v1/txt2img")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не найден TOKEN в .env — установи TOKEN=тут_токен")
-if not OPENAI_API_KEY:
-    # мы разрешаем работать и без OpenAI (см. ниже), но предупреждаем
-    print("WARN: OPENAI_API_KEY не найден в .env — генерация через OpenAI будет недоступна.")
+    raise RuntimeError("TOKEN not set in .env")
 
-# -----------------------
-# Настройка OpenAI
-# -----------------------
-openai.api_key = OPENAI_API_KEY
-
-# -----------------------
-# Файлы и логирование
-# -----------------------
+# ----------------- Logging -----------------
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# ----------------- Access control -----------------
 ACCESS_FILE = Path("access.json")
+if ACCESS_FILE.exists():
+    allowed_users = set(json.load(open(ACCESS_FILE))["allowed"])
+else:
+    allowed_users = set([ADMIN_USERNAME])
 
-def load_allowed():
-    if ACCESS_FILE.exists():
-        try:
-            with ACCESS_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                return set(data.get("allowed", []))
-        except Exception:
-            return set([ADMIN_USERNAME])
-    return set([ADMIN_USERNAME])
+def save_allowed():
+    with open(ACCESS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"allowed": list(allowed_users)}, f, ensure_ascii=False, indent=2)
 
-def save_allowed(allowed_set):
-    data = {"allowed": list(allowed_set)}
-    with ACCESS_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-allowed_users = load_allowed()
-
-# -----------------------
-# Кнопки клавиатуры
-# -----------------------
-admin_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🧠 ChatGPT"), KeyboardButton(text="🖼️ GPT Image")],
-        [KeyboardButton(text="✅ Дать доступ"), KeyboardButton(text="❌ Удалить доступ")]
-    ],
-    resize_keyboard=True
-)
-
-user_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🧠 ChatGPT"), KeyboardButton(text="🖼️ GPT Image")]
-    ],
-    resize_keyboard=True
-)
-
-# -----------------------
-# Утилиты
-# -----------------------
-def is_allowed(username: str | None) -> bool:
-    if username is None:
-        return False
+def is_allowed(username):
     return username in allowed_users
 
-# -----------------------
-# Хендлеры
-# -----------------------
+# ----------------- Keyboards -----------------
+admin_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("🧠 Chat"), KeyboardButton("🖼️ Image")],
+        [KeyboardButton("✅ Grant"), KeyboardButton("❌ Revoke")]
+    ], resize_keyboard=True
+)
+user_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton("🧠 Chat"), KeyboardButton("🖼️ Image")]],
+    resize_keyboard=True
+)
+
+# ----------------- Concurrency limit -----------------
+semaphore = asyncio.Semaphore(2)  # максимум 2 одновременных запроса
+
+# ----------------- Handlers -----------------
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    username = message.from_user.username
-    if not is_allowed(username):
-        await message.answer("⛔ У вас нет доступа к этому боту.")
+async def start(m: types.Message):
+    if not is_allowed(m.from_user.username):
+        await m.answer("⛔ Нет доступа.")
         return
+    kb = admin_kb if m.from_user.username == ADMIN_USERNAME else user_kb
+    await m.answer("Привет! Выбери режим.", reply_markup=kb)
 
-    if username == ADMIN_USERNAME:
-        await message.answer("👑 Привет, Админ!", reply_markup=admin_kb)
-    else:
-        await message.answer("🤖 Привет! Я твой GPT бот.", reply_markup=user_kb)
-
-# Простой режим: если пользователь нажал кнопку "ChatGPT" — просим ввести запрос
-@dp.message(lambda m: m.text == "🧠 ChatGPT")
-async def chatgpt_mode(message: types.Message):
-    if not is_allowed(message.from_user.username):
-        await message.answer("⛔ У вас нет доступа.")
+@dp.message(lambda msg: msg.text == "✅ Grant")
+async def grant_step(m: types.Message):
+    if m.from_user.username != ADMIN_USERNAME:
+        await m.answer("⛔ Только админ.")
         return
-    await message.answer("✍️ Напиши запрос для ChatGPT (я отправлю его в OpenAI).")
-    # следующий текст пользователя обработает universal_query
+    await m.answer("Отправь юзернейм (без @) для выдачи доступа.")
+    dp.message.register(handle_grant, lambda mm: True)
 
-# Аналогично для картинок
-@dp.message(lambda m: m.text == "🖼️ GPT Image")
-async def image_mode(message: types.Message):
-    if not is_allowed(message.from_user.username):
-        await message.answer("⛔ У вас нет доступа.")
-        return
-    await message.answer("🖌️ Опиши картинку, которую нужно сгенерировать (коротко).")
-
-# Управление доступом — доступны только админу
-@dp.message(lambda m: m.text in {"✅ Дать доступ", "❌ Удалить доступ"})
-async def access_control(message: types.Message):
-    if message.from_user.username != ADMIN_USERNAME:
-        await message.answer("⛔ Только админ может управлять доступом.")
-        return
-
-    if message.text == "✅ Дать доступ":
-        await message.answer("Введите юзернейм (без @), которому дать доступ:")
-        # следующий текст — grant step
-        dp.message.register(grant_access_step, lambda m: True)
-    else:
-        await message.answer("Введите юзернейм (без @), у которого удалить доступ:")
-        dp.message.register(remove_access_step, lambda m: True)
-
-async def grant_access_step(message: types.Message):
-    # ожидаем простой текст — юзернейм без @
-    username = message.text.strip().lstrip("@")
-    if not username:
-        await message.answer("Неверный юзернейм.")
-    else:
+async def handle_grant(m: types.Message):
+    username = m.text.strip().lstrip("@")
+    if username:
         allowed_users.add(username)
-        save_allowed(allowed_users)
-        await message.answer(f"✅ Доступ выдан пользователю @{username}")
-    dp.message.unregister(grant_access_step)
+        save_allowed()
+        await m.answer(f"✅ @{username} добавлен.")
+    dp.message.unregister(handle_grant)
 
-async def remove_access_step(message: types.Message):
-    username = message.text.strip().lstrip("@")
+@dp.message(lambda msg: msg.text == "❌ Revoke")
+async def revoke_step(m: types.Message):
+    if m.from_user.username != ADMIN_USERNAME:
+        await m.answer("⛔ Только админ.")
+        return
+    await m.answer("Отправь юзернейм (без @) для удаления доступа.")
+    dp.message.register(handle_revoke, lambda mm: True)
+
+async def handle_revoke(m: types.Message):
+    username = m.text.strip().lstrip("@")
     if username in allowed_users:
         allowed_users.remove(username)
-        save_allowed(allowed_users)
-        await message.answer(f"❌ Доступ удалён у @{username}")
+        save_allowed()
+        await m.answer(f"❌ @{username} удалён.")
     else:
-        await message.answer("⚠️ Такой пользователь не найден в списке.")
-    dp.message.unregister(remove_access_step)
+        await m.answer("Пользователь не найден.")
+    dp.message.unregister(handle_revoke)
 
-# Универсальный обработчик сообщения: если это текст и пользователь имеет доступ,
-# решаем, это запрос в ChatGPT или генерация картинки по последней команде.
+# ----------------- Chat -----------------
+@dp.message(lambda msg: msg.text == "🧠 Chat")
+async def enter_chat(m: types.Message):
+    if not is_allowed(m.from_user.username):
+        await m.answer("⛔ Нет доступа.")
+        return
+    await m.answer("Напиши сообщение для модели (ответит текстом).")
+    dp.message.register(handle_chat, lambda mm: mm.from_user.username == m.from_user.username)
+
+async def handle_chat(m: types.Message):
+    dp.message.unregister(handle_chat)
+    prompt = m.text.strip()
+    await m.answer("⌛ Запрос к модели...")
+    async with semaphore:
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"prompt": prompt, "max_new_tokens": 512}
+                async with session.post(CHAT_API_URL, json=payload, timeout=120) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        await m.answer(f"Ошибка chat-сервера: {resp.status}\n{txt}")
+                        return
+                    data = await resp.json()
+                    text = data.get("text") or data.get("generated_text") or str(data)
+                    await m.answer(text)
+        except asyncio.TimeoutError:
+            await m.answer("⏳ Таймаут при обращении к chat-серверу.")
+        except Exception as e:
+            await m.answer(f"Ошибка chat-сервера: {e}")
+
+# ----------------- Image -----------------
+@dp.message(lambda msg: msg.text == "🖼️ Image")
+async def enter_image(m: types.Message):
+    if not is_allowed(m.from_user.username):
+        await m.answer("⛔ Нет доступа.")
+        return
+    await m.answer("Отправь промпт для генерации изображения.")
+    dp.message.register(handle_image, lambda mm: mm.from_user.username == m.from_user.username)
+
+async def handle_image(m: types.Message):
+    dp.message.unregister(handle_image)
+    prompt = m.text.strip()
+    await m.answer("🎨 Генерация изображения...")
+    async with semaphore:
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "prompt": prompt,
+                    "steps": 20,
+                    "width": 512,
+                    "height": 512,
+                    "sampler_name": "Euler a"
+                }
+                async with session.post(IMG_API_URL, json=payload, timeout=300) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        await m.answer(f"Ошибка image-сервера: {resp.status}\n{txt}")
+                        return
+                    data = await resp.json()
+                    images = data.get("images") or []
+                    if not images:
+                        await m.answer("Пустой ответ от image-сервера.")
+                        return
+                    img_bytes = base64.b64decode(images[0])
+                    await m.answer_photo(photo=img_bytes)
+        except asyncio.TimeoutError:
+            await m.answer("⏳ Таймаут при генерации картинки.")
+        except Exception as e:
+            await m.answer(f"Ошибка генерации картинки: {e}")
+
+# ----------------- Fallback -----------------
 @dp.message()
-async def universal_query(message: types.Message):
-    username = message.from_user.username
-    if not is_allowed(username):
-        # игнорируем
-        return
+async def fallback(m: types.Message):
+    if is_allowed(m.from_user.username):
+        await m.reply("Используй кнопки: 🧠 Chat или 🖼️ Image (или /start).")
 
-    text = message.text.strip()
-    if not text:
-        return
-
-    # Решение: если сообщение начинается с "/img " — генерируем изображение,
-    # иначе — отправляем в ChatGPT.
-    if text.startswith("/img "):
-        prompt = text[len("/img "):].strip()
-        if not OPENAI_API_KEY:
-            await message.answer("⚠️ OpenAI API ключ не настроен — генерация изображений недоступна.")
-            return
-        await message.answer("🎨 Генерирую изображение...")
-        try:
-            resp = openai.images.generate(
-                model="gpt-image-1",
-                prompt=prompt,
-                size="512x512"
-            )
-            # Ответ может быть в resp.data[0].url
-            img_url = resp.data[0].url
-            await message.answer_photo(photo=img_url, caption="Готово!")
-        except Exception as e:
-            await message.answer(f"Ошибка при генерации изображения: {e}")
-    else:
-        # ChatGPT
-        if not OPENAI_API_KEY:
-            await message.answer("⚠️ OpenAI API ключ не настроен — чат недоступен.")
-            return
-        await message.answer("⌛ Думаю...")
-        try:
-            response = openai.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": text}]
-            )
-            reply = response.choices[0].message.content
-            await message.answer(reply)
-        except Exception as e:
-            await message.answer(f"Ошибка при обращении к OpenAI: {e}")
-
-# -----------------------
-# Запуск
-# -----------------------
+# ----------------- Run -----------------
 async def main():
-    print("Бот запущен. Убедись, что .env заполнен и .gitignore содержит .env")
+    print("Bot started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
