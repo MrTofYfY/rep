@@ -1,1 +1,9 @@
-pip install aiogram python-dotenv aiohttp gpt4all diffusers transformers accelerate scipy pillow
+aiogram
+python-dotenv
+aiohttp
+gpt4all
+diffusers
+transformers
+accelerate
+scipy
+pillow
