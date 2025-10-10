@@ -14,9 +14,9 @@ from dotenv import load_dotenv
 # ==========================================
 load_dotenv()  # Загружаем переменные из .env
 
-BOT_TOKEN = os.getenv("TOKEN")  # Токен телеграм-бота
+BOT_TOKEN = os.getenv("TOKEN")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "mellfreezy")
-HF_API_KEY = os.getenv("HF_API_KEY")  # Токен HuggingFace
+HF_API_KEY = os.getenv("HF_API_KEY")
 
 if not BOT_TOKEN or not HF_API_KEY:
     raise RuntimeError("❌ В .env не указан TOKEN или HF_API_KEY")
@@ -179,4 +179,6 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    # Для PythonAnywhere используем asyncio.run
+    import asyncio
     asyncio.run(main())
