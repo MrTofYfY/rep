@@ -3,3 +3,4 @@ python-dotenv
 Pillow
 pyzipper
 rarfile
+Flask
